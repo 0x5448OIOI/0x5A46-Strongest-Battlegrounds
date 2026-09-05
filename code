@@ -1184,6 +1184,68 @@ local function acharImagemNoHtml(html)
     if og then return (string.gsub(og, "&amp;", "&")) end
     return string.match(html, 'https://[%w%p]-%.jpg') or string.match(html, 'https://[%w%p]-%.png')
 end
+-- Resolve "ID / link / arquivo" numa imagem que da pra usar em
+-- qualquer ImageLabel. Ficou separado pra o medidor de fps poder ter
+-- fundo proprio sem eu duplicar tudo isso.
+-- Devolve: conteudo, arquivoSalvo, erro
+local function resolverFonteImagem(entrada, salt, diz)
+    entrada = string.gsub(string.gsub(tostring(entrada or ""), "^%s+", ""), "%s+$", "")
+    if entrada == "" then return nil, nil, nil end
+
+    if tonumber(entrada) then
+        return "rbxassetid://" .. entrada, "", nil
+    end
+    if string.sub(entrada, 1, 13) == "rbxassetid://" then
+        return entrada, "", nil
+    end
+    if string.sub(entrada, 1, 4) == "http" then
+        if not (writefile and getcustomasset) then
+            return nil, nil, "Seu executor nao tem writefile/getcustomasset."
+        end
+        local url = entrada
+        if not pareceImagemDireta(url) then
+            if diz then diz("Procurando a imagem na pagina...") end
+            local pagina = httpFetch(url)
+            local achou = pagina and acharImagemNoHtml(pagina)
+            if not achou then
+                return nil, nil, "Nao achei a imagem nessa pagina."
+            end
+            url = achou
+        end
+        local ext = string.find(string.lower(url), "%.jpe?g") and "jpg" or "png"
+        local id = hashStr(url) .. "_" .. tostring(salt or 0)
+        local arq
+        if makefolder and isfolder then
+            pcall(function() if not isfolder(BG_PASTA) then makefolder(BG_PASTA) end end)
+            arq = BG_PASTA .. "/img_" .. id .. "." .. ext
+        else
+            arq = "painel_0x5A46_" .. id .. "." .. ext
+        end
+        local jaTem = false
+        pcall(function() jaTem = isfile and isfile(arq) end)
+        if not jaTem then
+            if diz then diz("Baixando...") end
+            local dados = httpFetch(url)
+            if not dados then return nil, nil, "Falha ao baixar." end
+            if not pcall(function() writefile(arq, dados) end) then
+                return nil, nil, "Falha ao salvar."
+            end
+        end
+        local conteudo
+        if not pcall(function() conteudo = getcustomasset(arq) end) or not conteudo then
+            return nil, nil, "Falha ao ler a imagem salva."
+        end
+        return conteudo, arq, nil
+    end
+    -- nome de arquivo na pasta do executor
+    if not getcustomasset then return nil, nil, "Seu executor nao tem getcustomasset." end
+    local conteudo
+    if not pcall(function() conteudo = getcustomasset(entrada) end) or not conteudo then
+        return nil, nil, "Arquivo nao achado na pasta do executor."
+    end
+    return conteudo, entrada, nil
+end
+
 local function definirFundo(entrada, silencioso)
     entrada = string.gsub(string.gsub(tostring(entrada or ""), "^%s+", ""), "%s+$", "")
     BG.imagem = entrada
@@ -1353,6 +1415,186 @@ do
         "jogo. A ultima fica salva e volta sozinha na proxima vez.", 116)
     carregarFundo()
 end
+--==================================================================
+--                    MEDIDOR DE FPS E PING
+--==================================================================
+-- Painelzinho solto, arrastavel, com fundo proprio. Nao usa nada da
+-- imagem do painel grande: guarda no arquivo dele mesmo.
+-- transp    = transparencia da PROPRIA imagem (0 = imagem cheia)
+-- escurecer = o quanto do cartao preto fica atras dela (0 = nada,
+--             so a imagem; suba se o texto sumir em cima de foto clara)
+local MED = { ligado = false, imagem = "", arquivo = "", salt = 0,
+              transp = 0, escurecer = 0, escala = 1, x = 20, y = 90,
+              versao = 2 }
+local MED_ARQUIVO = "painel_0x5A46_medidor.json"
+local statusMed
+
+local function salvarMed()
+    if not writefile then return end
+    pcall(function() writefile(MED_ARQUIVO, HttpService:JSONEncode(MED)) end)
+end
+
+local velhaMed = RAIZ:FindFirstChild("Medidor_0x5A46")
+if velhaMed then pcall(function() velhaMed:Destroy() end) end
+
+local telaMed = new("ScreenGui", {
+    Name = "Medidor_0x5A46", ResetOnSpawn = false, IgnoreGuiInset = true,
+    DisplayOrder = 998, Enabled = false, Parent = RAIZ,
+})
+local caixaMed = new("Frame", {
+    Position = UDim2.fromOffset(MED.x, MED.y), Size = UDim2.fromOffset(132, 52),
+    BackgroundColor3 = Theme.Card, BackgroundTransparency = 0.1,
+    BorderSizePixel = 0, ClipsDescendants = true, Parent = telaMed,
+})
+corner(10, caixaMed)
+stroke(Theme.Stroke, caixaMed, 1, 0.3)
+local fundoMed = new("ImageLabel", {
+    Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+    Image = "", ImageTransparency = MED.transp,
+    ScaleType = Enum.ScaleType.Crop, Visible = false, ZIndex = 0, Parent = caixaMed,
+})
+corner(10, fundoMed)
+local textoFps = new("TextLabel", {
+    Position = UDim2.fromOffset(10, 6), Size = UDim2.new(1, -20, 0, 20),
+    BackgroundTransparency = 1, Font = Enum.Font.GothamBold, Text = "-- FPS",
+    TextSize = 15, TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Left,
+    TextStrokeTransparency = 0.6, ZIndex = 2, Parent = caixaMed,
+})
+local textoPing = new("TextLabel", {
+    Position = UDim2.fromOffset(10, 26), Size = UDim2.new(1, -20, 0, 18),
+    BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, Text = "-- ms",
+    TextSize = 12, TextColor3 = Theme.SubText, TextXAlignment = Enum.TextXAlignment.Left,
+    TextStrokeTransparency = 0.7, ZIndex = 2, Parent = caixaMed,
+})
+
+-- Sem imagem o cartao e o fundo. COM imagem ele sai da frente:
+-- fica so o quanto de escuro voce pedir no slider "Escurecer".
+local function ajustarCartaoMed()
+    if fundoMed.Visible then
+        caixaMed.BackgroundTransparency = 1 - MED.escurecer
+        textoFps.TextStrokeTransparency  = 0.25
+        textoPing.TextStrokeTransparency = 0.35
+    else
+        caixaMed.BackgroundTransparency = 0.1
+        textoFps.TextStrokeTransparency  = 0.6
+        textoPing.TextStrokeTransparency = 0.7
+    end
+end
+
+-- arrastar
+do
+    local arrastando, inicioPos, inicioMouse = false, nil, nil
+    caixaMed.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            arrastando, inicioPos, inicioMouse = true, caixaMed.Position, input.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    arrastando = false
+                    MED.x, MED.y = caixaMed.Position.X.Offset, caixaMed.Position.Y.Offset
+                    salvarMed()
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if not arrastando or not souAtual() then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            local d = input.Position - inicioMouse
+            caixaMed.Position = UDim2.fromOffset(inicioPos.X.Offset + d.X,
+                                                 inicioPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+local function definirFundoMedidor(entrada, silencioso)
+    entrada = tostring(entrada or "")
+    MED.imagem = entrada
+    local function diz(t) if statusMed then statusMed.set(t) end end
+    if entrada == "" then
+        fundoMed.Image = "" fundoMed.Visible = false
+        MED.arquivo = ""
+        ajustarCartaoMed()
+        diz("Sem imagem.")
+        salvarMed()
+        return
+    end
+    local conteudo, arq, erro = resolverFonteImagem(entrada, MED.salt, diz)
+    if erro or not conteudo then
+        diz(erro or "Nao foi possivel aplicar.")
+        return
+    end
+    MED.arquivo = arq or ""
+    fundoMed.Image = conteudo
+    fundoMed.ImageTransparency = MED.transp
+    fundoMed.Visible = true
+    ajustarCartaoMed()
+    diz("Imagem aplicada no medidor.")
+    salvarMed()
+    if not silencioso then
+        win:Notify({ Title = "Medidor", Text = "fundo trocado", Duration = 3 })
+    end
+end
+
+-- fps por media movel, ping do Stats
+local Stats = game:GetService("Stats")
+local fpsMed = 60
+RunService.RenderStepped:Connect(function(dt)
+    if not souAtual() then return end
+    if dt > 0 then fpsMed = fpsMed * 0.9 + (1 / dt) * 0.1 end
+end)
+
+task.spawn(function()
+    while souAtual() do
+        task.wait(0.25)
+        if telaMed.Enabled then
+            local ping = LocalPlayer:GetAttribute("Ping")
+            if type(ping) ~= "number" or ping <= 0 then
+                local ok, ms = pcall(function()
+                    return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+                end)
+                ping = (ok and ms) or 0
+            end
+            local f = math.floor(fpsMed)
+            textoFps.Text = f .. " FPS"
+            textoFps.TextColor3 = (f >= 50 and Color3.fromRGB(235,235,235))
+                or (f >= 30 and Color3.fromRGB(210,190,120))
+                or Color3.fromRGB(220,120,120)
+            textoPing.Text = math.floor(ping) .. " ms"
+            textoPing.TextColor3 = (ping <= 90 and Theme.SubText)
+                or (ping <= 180 and Color3.fromRGB(210,190,120))
+                or Color3.fromRGB(220,120,120)
+        end
+    end
+end)
+
+pcall(function()
+    if readfile and isfile and isfile(MED_ARQUIVO) then
+        local d = HttpService:JSONDecode(readfile(MED_ARQUIVO))
+        if type(d) == "table" then
+            for k, v in pairs(d) do
+                if MED[k] ~= nil and type(MED[k]) == type(v) then MED[k] = v end
+            end
+            -- config da v1 vinha com a imagem 35% apagada e o cartao
+            -- preto atras: ficava quase sem dar pra ver a foto.
+            if (d.versao or 1) < 2 then
+                MED.transp, MED.escurecer, MED.versao = 0, 0, 2
+                salvarMed()
+            end
+        end
+    end
+end)
+caixaMed.Position = UDim2.fromOffset(MED.x, MED.y)
+fundoMed.ImageTransparency = MED.transp
+ajustarCartaoMed()
+caixaMed.Size = UDim2.fromOffset(math.floor(132 * MED.escala),
+                                 math.floor(52 * MED.escala))
+telaMed.Enabled = MED.ligado
+if MED.imagem ~= "" then
+    task.spawn(function() task.wait(0.6) pcall(definirFundoMedidor, MED.imagem, true) end)
+end
+
 ---------------------------------------------------------------- CONFIG
 local abaConfig = win:Tab("Config", "≡")
 do
@@ -1367,6 +1609,47 @@ do
         "END esconde o painel inteiro\n" ..
         "K liga o ESP\n" ..
         "Chip de tecla: clique = bindar · direito = limpar"
+    local m = abaConfig:Section("Medidor de FPS e ping", nil, 2)
+    m:Toggle({ Name = "Mostrar medidor", Default = MED.ligado,
+        Callback = function(on)
+            MED.ligado = on
+            telaMed.Enabled = on
+            salvarMed()
+        end })
+    local caixaM = m:Input({ Name = "Fundo do medidor",
+        Placeholder = "ID  /  link.png  /  foto.png", Default = MED.imagem,
+        Callback = function(t) definirFundoMedidor(t) end })
+    m:Button({ Name = "Aplicar", Callback = function() definirFundoMedidor(caixaM.Text) end })
+    m:Button({ Name = "Remover fundo", Callback = function()
+        caixaM.Text = "" definirFundoMedidor("")
+    end })
+    m:Slider({ Name = "Apagar a imagem", Min = 0, Max = 100,
+        Default = math.floor(MED.transp * 100), Suffix = "%",
+        Callback = function(v)
+            MED.transp = v / 100
+            fundoMed.ImageTransparency = MED.transp
+            salvarMed()
+        end })
+    m:Slider({ Name = "Escurecer atras", Min = 0, Max = 100,
+        Default = math.floor(MED.escurecer * 100), Suffix = "%",
+        Callback = function(v)
+            MED.escurecer = v / 100
+            ajustarCartaoMed()
+            salvarMed()
+        end })
+    m:Slider({ Name = "Tamanho", Min = 70, Max = 200, Default = math.floor(MED.escala * 100),
+        Suffix = "%",
+        Callback = function(v)
+            MED.escala = v / 100
+            caixaMed.Size = UDim2.fromOffset(math.floor(132 * MED.escala),
+                                             math.floor(52 * MED.escala))
+            textoFps.TextSize = math.floor(15 * MED.escala)
+            textoPing.TextSize = math.floor(12 * MED.escala)
+            salvarMed()
+        end })
+    statusMed = m:Info("Arraste o medidor pra onde quiser. A posicao, o "
+        .. "fundo e o tamanho ficam salvos e voltam sozinhos.", 46)
+
     local cre = abaConfig:Section("Creditos", nil, 2)
     cre:Info(
         "Scripts: <b>Th.exe</b>\n" ..
