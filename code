@@ -1313,7 +1313,7 @@ local function carregarFundo()
     end
 end
 ---------------------------------------------------------------- CUSTOMIZE
-local abaCustom = win:Tab("Customize", "◆")
+local abaCustom = win:Tab("Customize", "✦")
 do
     local img = abaCustom:Section("Imagem de fundo", "ID do Roblox, link ou arquivo", 1)
     local caixa = img:Input({ Name = "Origem", Placeholder = "1234567890  /  link.png  /  foto.png",
@@ -1509,6 +1509,9 @@ local CFG = {
     VirarSuave = 0.0,               -- 0 = instantaneo
     VirarSoBloqueando = true,       -- so vira quando o block dispara
 
+    -- Compensacao de atraso. Ver a secao ATRASO logo abaixo.
+    Compensar = true, CompensarTeto = 0.6,
+
 }
 
 local function saveCfg()
@@ -1620,11 +1623,64 @@ local function distEfetiva(hrp, meuHrp)
             -- studs virava "13 studs" na conta e passava no filtro.
             -- A dianteira nunca pode comer mais que metade do que
             -- realmente separa voces dois.
-            local desconto = math.min(vindo * CFG.BlockPrever, d * 0.5)
+            -- com ping alto ele anda mais durante o atraso, entao a
+            -- dianteira cresce junto
+            local dianteira = CFG.BlockPrever + folga()
+            local desconto = math.min(vindo * dianteira, d * 0.5)
             d = d - desconto
         end
     end
     return math.max(0, d)
+end
+
+-- ==================================================================
+-- ATRASO: PING E FPS
+-- ==================================================================
+-- Todo o auto block e uma corrida: o aviso chega, eu aperto F, o
+-- servidor recebe. Com ping de 51ms e 60 fps isso cabe na janela de
+-- ~0.22s que o LastM1Fire da. Com ping de 250ms e 20 fps, nao cabe:
+--
+--     ping/2 pro aviso chegar          0.125s
+--     ping/2 pro meu bloqueio chegar   0.125s
+--     ate 2 quadros de granularidade   0.100s
+--     -------------------------------  -------
+--     so de atraso                     0.350s   > a janela inteira
+--
+-- Reagir mais rapido nao resolve, porque nada disso e o script: e a
+-- distancia ate o servidor e o tempo entre dois quadros.
+--
+-- O que resolve e a guarda subir ANTES e ficar MAIS TEMPO, na medida
+-- do atraso que a pessoa realmente tem. Entao eu meco os dois e somo
+-- essa folga na duracao da guarda, na dianteira do dash e no alcance
+-- da antecipacao.
+--
+-- O TSB publica o ping no atributo @Ping do jogador - vi 51 no teu.
+-- Se nao existir, caio no Stats do Roblox.
+local Stats = game:GetService("Stats")
+local fpsMedio, ultQuadro = 60, os.clock()
+RunService.RenderStepped:Connect(function(dt)
+    if dt > 0 then
+        -- media que se move devagar, pra um travo nao virar panico
+        fpsMedio = fpsMedio * 0.9 + (1 / dt) * 0.1
+    end
+end)
+
+local function pingSegundos()
+    local v = LP:GetAttribute("Ping")
+    if type(v) == "number" and v > 0 then return v / 1000 end
+    local ok, ms = pcall(function()
+        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok and type(ms) == "number" and ms > 0 then return ms / 1000 end
+    return 0.05
+end
+
+-- quanto de folga a conexao e o computador desta pessoa exigem
+local function folga()
+    if not CFG.Compensar then return 0 end
+    local porQuadro = 1 / math.max(10, fpsMedio)
+    local f = pingSegundos() + porQuadro * 2
+    return math.min(f, CFG.CompensarTeto)
 end
 
 -- ele esta virado pra mim?
@@ -1731,7 +1787,8 @@ local function pedirBloqueio(motivo, hrpAgressor, segurar)
         stat.bloqueios = stat.bloqueios + 1
         pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
     end
-    local ate = agora + (segurar or CFG.BlockSegurar)
+    -- a guarda fica de pe pelo tempo pedido MAIS o atraso desta pessoa
+    local ate = agora + (segurar or CFG.BlockSegurar) + folga()
     if ate > bloqueadoAte then bloqueadoAte = ate end
     local teto = stat.ultimoBloq + CFG.BlockMaxSeguido
     if bloqueadoAte > teto then bloqueadoAte = teto end
@@ -1755,12 +1812,13 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- quem solta a guarda
-task.spawn(function()
-    while souAtual() do
-        task.wait(0.02)
-        if segurandoF and (os.clock() >= bloqueadoAte or not CFG.Block) then
-            soltarBloqueio()
-        end
+-- Heartbeat em vez de task.wait: com fps baixo o wait nao acorda mais
+-- rapido que um quadro de qualquer jeito, e assim eu nao pago espera
+-- em cima da espera.
+RunService.Heartbeat:Connect(function()
+    if not souAtual() then return end
+    if segurandoF and (os.clock() >= bloqueadoAte or not CFG.Block) then
+        soltarBloqueio()
     end
 end)
 
@@ -1923,7 +1981,9 @@ local function ehGatilho(nome, valorNovo, dist)
         return true, "M1", CFG.BlockSegurar
     end
     if nome == "HoldingM1" and CFG.BlockAntecipar and valorNovo == true then
-        if dist <= CFG.BlockAnteciparAlcance then
+        -- 16 studs/s e a corrida do TSB: com o atraso desta pessoa, ele
+        -- percorre isso antes do meu bloqueio existir do lado de la
+        if dist <= CFG.BlockAnteciparAlcance + folga() * 16 then
             return true, "puxou o M1", CFG.BlockSegurar
         end
         return false
@@ -2061,7 +2121,7 @@ end)
 --==================================================================
 -- A ABA
 --==================================================================
-local aba = P.Tab("TSB", "◆")
+local aba = P.Tab("Combat", "◆")
 local infoEstado
 
 do
@@ -2072,6 +2132,7 @@ do
     Liga(b, { Key = "BlockM1", Name = "Block M1" })
     Liga(b, { Key = "BlockSkill", Name = "Block Skill" })
     Liga(b, { Key = "VirarCorpo", Name = "Virar o corpo" })
+    Liga(b, { Key = "Compensar", Name = "Compensar ping e fps" })
 
     local e = aba:Section("Estado", nil, 2)
     infoEstado = e:Info("...", 76)
@@ -2098,10 +2159,12 @@ task.spawn(function()
         if infoEstado then
             local c, meuHrp = meuChar()
             local perto = meuHrp and inimigos(60)[1]
-            infoEstado.set(("<b>eu:</b> Blocking=%s%s\n<b>mais perto:</b> %s\n<b>ultimo:</b> %s (%d)")
+            infoEstado.set(("<b>eu:</b> Blocking=%s%s · %dfps · %dms · folga %.2fs\n"
+                .. "<b>mais perto:</b> %s\n<b>ultimo:</b> %s (%d)")
                 :format(
                     tostring(c and c:GetAttribute("Blocking")),
                     (os.clock() < pausaAte) and " · CALADO" or "",
+                    math.floor(fpsMedio), math.floor(pingSegundos() * 1000), folga(),
                     perto and string.format("%s a %.0f · HoldingM1=%s",
                         perto.plr.Name, perto.d,
                         tostring(perto.char:GetAttribute("HoldingM1"))) or "ninguem",
@@ -2259,9 +2322,19 @@ do
         return Vector2.new(sp.X, sp.Y)
     end
 
+    -- ESP MAIS LEVE
+    -- caixaLimpa percorre TODAS as pecas do personagem. Fazendo isso
+    -- pra 20 jogadores a cada quadro sao milhares de iteracoes por
+    -- segundo, e num computador fraco o proprio ESP derruba o fps que
+    -- o auto block precisa. O tamanho de um boneco quase nao muda, so
+    -- a posicao. Entao meco o tamanho de vez em quando e sigo a
+    -- posicao todo quadro.
+    local caixaCache = setmetatable({}, { __mode = "k" })
+    local INTERVALO_CAIXA = 0.25
+
     -- caixa so com as pecas perto do tronco: peca solta longe estoura
     -- a caixa, que foi o que aconteceu no MM2 com a faca do assassino
-    local function caixaLimpa(m, hrp)
+    local function caixaLimpaBruta(m, hrp)
         local ctr = hrp.Position
         local mnx, mny, mnz =  math.huge,  math.huge,  math.huge
         local mxx, mxy, mxz = -math.huge, -math.huge, -math.huge
@@ -2279,9 +2352,20 @@ do
                 achou = true
             end
         end
-        if not achou then return CFrame.new(ctr), Vector3.new(4, 6, 2) end
-        return CFrame.new((mnx+mxx)/2, (mny+mxy)/2, (mnz+mxz)/2),
-               Vector3.new(mxx-mnx, mxy-mny, mxz-mnz)
+        if not achou then return CFrame.new(ctr), Vector3.new(4, 6, 2), Vector3.zero end
+        local centro = Vector3.new((mnx+mxx)/2, (mny+mxy)/2, (mnz+mxz)/2)
+        return CFrame.new(centro), Vector3.new(mxx-mnx, mxy-mny, mxz-mnz), centro - ctr
+    end
+
+    local function caixaLimpa(m, hrp)
+        local c = caixaCache[m]
+        if not c or os.clock() - c.quando > INTERVALO_CAIXA then
+            local _, tam, desvio = caixaLimpaBruta(m, hrp)
+            c = { tam = tam, desvio = desvio, quando = os.clock() }
+            caixaCache[m] = c
+        end
+        -- posicao sempre atual, tamanho reaproveitado
+        return CFrame.new(hrp.Position + c.desvio), c.tam
     end
 
     RunService.RenderStepped:Connect(function()
