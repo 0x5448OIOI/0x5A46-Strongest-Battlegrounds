@@ -1510,7 +1510,13 @@ local CFG = {
     VirarSoBloqueando = true,       -- so vira quando o block dispara
 
     -- Compensacao de atraso. Ver a secao ATRASO logo abaixo.
+    -- Tudo aqui so entra em acao quando a folga medida passa do
+    -- limite. Em maquina boa com ping baixo, nada disso liga.
     Compensar = true, CompensarTeto = 0.6,
+    CompensarLimite = 0.12,      -- a partir de quanta folga o modo entra
+    CompensarPerto = true,       -- guarda de pe so por ter gente perto
+    CompensarPertoAlcance = 8,   -- base; o atraso alarga isso sozinho
+    CompensarReenviar = true,    -- reenvia o F se a guarda nao subiu
 
 }
 
@@ -1683,6 +1689,13 @@ local function folga()
     return math.min(f, CFG.CompensarTeto)
 end
 
+-- O modo de compensacao so vale a pena pra quem realmente esta
+-- atrasado. Com ping baixo e fps alto ele fica desligado sozinho, e o
+-- auto block segue reativo e discreto como voce afinou.
+local function atrasadoDemais()
+    return CFG.Compensar and folga() >= CFG.CompensarLimite
+end
+
 -- ele esta virado pra mim?
 local function viradoPraMim(hrp, meuHrp)
     local para = (meuHrp.Position - hrp.Position)
@@ -1712,14 +1725,33 @@ end
 --     getgenv().__TSB_APRENDIZADO
 local bloqueadoAte = 0
 
+-- O Humanoid gira o boneco sozinho quando AutoRotate esta ligado. Eu
+-- escrevo o CFrame pra virar voce e ele escreve por cima no mesmo
+-- quadro: cabo de guerra, que na tela parece "demora pra virar".
+-- Enquanto a guarda estiver de pe eu desligo o AutoRotate e devolvo
+-- exatamente como estava depois.
+local autoRotateOriginal = nil
+
+local function devolverAutoRotate()
+    if autoRotateOriginal ~= nil then
+        local _, _, hum = meuChar()
+        if hum then pcall(function() hum.AutoRotate = autoRotateOriginal end) end
+        autoRotateOriginal = nil
+    end
+end
+
 local function soltarBloqueio()
     if segurandoF then
         pcall(function() VIM:SendKeyEvent(false, Enum.KeyCode.F, false, game) end)
         segurandoF = false
     end
+    devolverAutoRotate()
 end
 ENV_solta = soltarBloqueio
-ENV.__TSB_RESTAURAR = soltarBloqueio
+ENV.__TSB_RESTAURAR = function()
+    soltarBloqueio()
+    devolverAutoRotate()
+end
 
 -- ==================================================================
 -- QUANDO EU NAO QUERO SER BLOQUEADO
@@ -1785,6 +1817,14 @@ local function pedirBloqueio(motivo, hrpAgressor, segurar)
         segurandoF = true
         stat.ultimoBloq = agora
         stat.bloqueios = stat.bloqueios + 1
+        -- tira o Humanoid da disputa ANTES de virar
+        if CFG.Virar and CFG.VirarCorpo and autoRotateOriginal == nil then
+            local _, _, hum = meuChar()
+            if hum then
+                autoRotateOriginal = hum.AutoRotate
+                pcall(function() hum.AutoRotate = false end)
+            end
+        end
         pcall(function() VIM:SendKeyEvent(true, Enum.KeyCode.F, false, game) end)
     end
     -- a guarda fica de pe pelo tempo pedido MAIS o atraso desta pessoa
@@ -1802,8 +1842,11 @@ end
 -- ELE GIRA, EU GIRO JUNTO
 -- Virar uma vez na hora do bloqueio nao basta: o cara circula em
 -- volta e a guarda, que so protege a frente, fica olhando pro vazio.
--- Enquanto a guarda estiver de pe, eu refaco a mira todo quadro.
-RunService.RenderStepped:Connect(function()
+--
+-- E vai no Heartbeat, nao no RenderStepped: o RenderStepped roda ANTES
+-- da fisica, entao a rotacao do personagem acontecia depois e apagava
+-- a minha. No Heartbeat eu escrevo por ultimo e fica.
+RunService.Heartbeat:Connect(function()
     if not souAtual() then return end
     if segurandoF and CFG.Virar and CFG.VirarCorpo
        and agressorAtual and agressorAtual.Parent then
@@ -1819,6 +1862,34 @@ RunService.Heartbeat:Connect(function()
     if not souAtual() then return end
     if segurandoF and (os.clock() >= bloqueadoAte or not CFG.Block) then
         soltarBloqueio()
+    end
+end)
+
+-- CONFERE SE A GUARDA SUBIU MESMO
+-- Eu so mandava o F quando achava que a guarda estava baixa. Se ela
+-- caisse no jogo sem eu saber - guarda quebrada, tecla perdida, o jogo
+-- recusando naquele instante - a minha variavel continuava dizendo que
+-- estava segurando e eu nunca reenviava.
+--
+-- O @Blocking do meu personagem e a verdade. Se ele diz falso enquanto
+-- eu deveria estar bloqueando, eu aperto de novo.
+task.spawn(function()
+    local ultimaTentativa = 0
+    while souAtual() do
+        task.wait(0.05)
+        if segurandoF and os.clock() < bloqueadoAte
+           and CFG.CompensarReenviar and atrasadoDemais() then
+            local c = LP.Character
+            if c and c:GetAttribute("Blocking") ~= true
+               and os.clock() - ultimaTentativa > 0.12 then
+                ultimaTentativa = os.clock()
+                pcall(function()
+                    VIM:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+                    VIM:SendKeyEvent(true,  Enum.KeyCode.F, false, game)
+                end)
+                stat.motivo = stat.motivo .. " · reenviei o F"
+            end
+        end
     end
 end)
 
@@ -1872,17 +1943,30 @@ task.spawn(function()
     end
 end)
 
--- guarda sempre: nao espera golpe nenhum, so fica de pe enquanto tem
--- alguem perto o bastante pra te socar
+-- GUARDA POR PROXIMIDADE
+-- Com atraso alto, reagir nao ganha: quando o aviso chega, o soco ja
+-- saiu. A saida e a guarda ja estar de pe antes de existir soco.
+--
+-- Isso liga sozinho, so quando a folga medida passa do limite. Quem
+-- joga com 50ms e 60fps nunca ve isso acontecer; quem joga com 250ms
+-- e 25fps passa a ter guarda de pe perto do inimigo, que e a unica
+-- coisa que funciona nessa condicao.
+--
+-- O alcance cresce com o atraso: o cara corre ~16 studs/s, entao com
+-- meio segundo de folga ele cobre 8 studs enquanto meu bloqueio viaja.
 task.spawn(function()
     while souAtual() do
         task.wait(0.08)
-        if CFG.Block and CFG.BlockSempre then
+        local porAtraso = CFG.CompensarPerto and atrasadoDemais()
+        if CFG.Block and (CFG.BlockSempre or porAtraso) then
             local _, meuHrp = meuChar()
             if meuHrp and os.clock() >= pausaAte then
-                local perto = inimigos(CFG.BlockSempreAlcance)[1]
+                local alcance = CFG.BlockSempre and CFG.BlockSempreAlcance
+                    or (CFG.CompensarPertoAlcance + folga() * 16)
+                local perto = inimigos(alcance)[1]
                 if perto then
-                    pedirBloqueio(string.format("guarda sempre · %s a %.0f",
+                    pedirBloqueio(string.format("%s · %s a %.0f",
+                        porAtraso and "perto (atraso)" or "guarda sempre",
                         perto.plr.Name, perto.d), perto.hrp)
                 end
             end
@@ -2133,6 +2217,7 @@ do
     Liga(b, { Key = "BlockSkill", Name = "Block Skill" })
     Liga(b, { Key = "VirarCorpo", Name = "Virar o corpo" })
     Liga(b, { Key = "Compensar", Name = "Compensar ping e fps" })
+    Liga(b, { Key = "CompensarPerto", Name = "Guarda perto (so com atraso)" })
 
     local e = aba:Section("Estado", nil, 2)
     infoEstado = e:Info("...", 76)
@@ -2159,12 +2244,13 @@ task.spawn(function()
         if infoEstado then
             local c, meuHrp = meuChar()
             local perto = meuHrp and inimigos(60)[1]
-            infoEstado.set(("<b>eu:</b> Blocking=%s%s · %dfps · %dms · folga %.2fs\n"
+            infoEstado.set(("<b>eu:</b> Blocking=%s%s · %dfps · %dms · folga %.2fs%s\n"
                 .. "<b>mais perto:</b> %s\n<b>ultimo:</b> %s (%d)")
                 :format(
                     tostring(c and c:GetAttribute("Blocking")),
                     (os.clock() < pausaAte) and " · CALADO" or "",
                     math.floor(fpsMedio), math.floor(pingSegundos() * 1000), folga(),
+                    atrasadoDemais() and " · COMPENSANDO" or "",
                     perto and string.format("%s a %.0f · HoldingM1=%s",
                         perto.plr.Name, perto.d,
                         tostring(perto.char:GetAttribute("HoldingM1"))) or "ninguem",
